@@ -135,10 +135,35 @@ export function x402Routes(routes: RouteMap) {
       const config: Record<string, any> = {};
 
       for (const [key, def] of Object.entries(routes)) {
-        const bazaarInputSchema: Record<string, any> = {};
-        if (def.query) bazaarInputSchema.queryParams = fieldsToBazaarSchema(def.query);
-        if (def.body) bazaarInputSchema.bodyFields = fieldsToBazaarSchema(def.body);
-        if (def.path) bazaarInputSchema.pathFields = fieldsToBazaarSchema(def.path);
+        const [method] = key.split(" ");
+        const isBodyMethod = ["POST", "PUT", "PATCH"].includes(method);
+
+        // Build bazaar info.input in official @x402/extensions format
+        const input: Record<string, any> = { type: "http", method };
+        if (def.query) input.queryParams = fieldsToBazaarSchema(def.query);
+        if (def.body && isBodyMethod) {
+          input.bodyType = "json";
+          input.body = fieldsToBazaarSchema(def.body);
+        }
+
+        // Build bazaar schema in official format
+        const inputSchemaProps: Record<string, any> = {
+          type: { type: "string", const: "http" },
+          method: { type: "string", enum: [method] },
+        };
+        if (def.query) {
+          inputSchemaProps.queryParams = {
+            type: "object",
+            ...fieldsToJsonSchema(def.query),
+          };
+        }
+        if (def.body && isBodyMethod) {
+          inputSchemaProps.bodyType = { type: "string", enum: ["json"] };
+          inputSchemaProps.body = {
+            type: "object",
+            ...fieldsToJsonSchema(def.body),
+          };
+        }
 
         config[key] = {
           accepts: [
@@ -153,11 +178,20 @@ export function x402Routes(routes: RouteMap) {
           ...(def.mimeType && { mimeType: def.mimeType }),
           extensions: {
             bazaar: {
-              discoverable: true,
-              openApiUrl: "/.well-known/openapi.json",
-              ...(Object.keys(bazaarInputSchema).length > 0 && {
-                inputSchema: bazaarInputSchema,
-              }),
+              info: {
+                input,
+                output: { type: def.mimeType?.includes("json") ? "json" : "raw" },
+              },
+              schema: {
+                properties: {
+                  input: {
+                    properties: {
+                      method: { type: "string", enum: [method] },
+                    },
+                    required: ["method"],
+                  },
+                },
+              },
             },
           },
         };
@@ -229,4 +263,77 @@ export function x402Routes(routes: RouteMap) {
       });
     },
   };
+}
+
+/**
+ * Derive an OpenAPI spec from an existing cdpPaymentMiddleware config.
+ *
+ * Usage:
+ *   import { openapiFromMiddleware } from "x402-openapi";
+ *
+ *   const PAYMENT_CONFIG = { "POST /": { ... } };
+ *   app.use(cdpPaymentMiddleware((env) => PAYMENT_CONFIG));
+ *   app.get("/.well-known/openapi.json", openapiFromMiddleware("x402 QR Code", "qr.camelai.io", PAYMENT_CONFIG));
+ */
+export function openapiFromMiddleware(
+  title: string,
+  domain: string,
+  config: Record<string, any>
+) {
+  const paths: Record<string, any> = {};
+
+  for (const [key, def] of Object.entries(config)) {
+    const [method, ...pathParts] = key.split(" ");
+    const path = pathParts.join(" ") || "/";
+    const httpMethod = method.toLowerCase();
+
+    const price = def.accepts?.[0]?.price || "unknown";
+    const description = def.description || title;
+    const bazaarInput = def.extensions?.bazaar?.info?.input;
+    const responseMime = def.mimeType || "application/json";
+
+    const operation: Record<string, any> = {
+      summary: description,
+      description: `${description}. Requires x402 payment (${price} USDC on Base).`,
+      responses: {
+        "200": { description: "Success", content: { [responseMime]: {} } },
+        "402": { description: "Payment Required — sign a USDC payment on Base and resend with the payment header" },
+        "400": { description: "Bad request" },
+      },
+    };
+
+    if (bazaarInput?.body && ["post", "put", "patch"].includes(httpMethod)) {
+      const properties: Record<string, any> = {};
+      const required: string[] = [];
+      for (const [field, fieldDef] of Object.entries(bazaarInput.body) as [string, any][]) {
+        properties[field] = { type: fieldDef.type || "string" };
+        if (fieldDef.description) properties[field].description = fieldDef.description;
+        if (fieldDef.required) required.push(field);
+      }
+      operation.requestBody = {
+        required: true,
+        content: {
+          "application/json": {
+            schema: { type: "object", properties, ...(required.length > 0 && { required }) },
+          },
+        },
+      };
+    }
+
+    if (!paths[path]) paths[path] = {};
+    paths[path][httpMethod] = operation;
+  }
+
+  const spec = {
+    openapi: "3.1.0",
+    info: {
+      title,
+      version: "1.0.0",
+      "x-pricing": { currency: "USDC", network: "Base (eip155:8453)" },
+    },
+    servers: [{ url: `https://${domain}` }],
+    paths,
+  };
+
+  return (c: any) => c.json(spec);
 }
